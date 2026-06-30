@@ -14,6 +14,36 @@ struct TrackFetchResult {
     let errorMessage: String?
 }
 
+struct MusicPlayerInfo {
+    let title: String?
+    let artist: String?
+    let album: String?
+    let albumArtist: String?
+    let state: String?
+
+    var isPlaying: Bool {
+        state == "Playing"
+    }
+
+    var hasTrackMetadata: Bool {
+        !(title ?? "").isEmpty
+    }
+
+    init(userInfo: [AnyHashable: Any]) {
+        title = MusicPlayerInfo.string(userInfo["Name"])
+        artist = MusicPlayerInfo.string(userInfo["Artist"])
+        album = MusicPlayerInfo.string(userInfo["Album"])
+        albumArtist = MusicPlayerInfo.string(userInfo["Album Artist"])
+        state = MusicPlayerInfo.string(userInfo["Player State"])
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 enum MusicCommand: String {
     case playPause = "playpause"
     case nextTrack = "next track"
@@ -21,6 +51,20 @@ enum MusicCommand: String {
 }
 
 final class MusicController {
+    private let playerInfoNotification = Notification.Name("com.apple.Music.playerInfo")
+
+    func observePlayerInfo(_ handler: @escaping (MusicPlayerInfo) -> Void) -> NSObjectProtocol {
+        DistributedNotificationCenter.default().addObserver(forName: playerInfoNotification,
+                                                            object: nil,
+                                                            queue: .main) { notification in
+            handler(MusicPlayerInfo(userInfo: notification.userInfo ?? [:]))
+        }
+    }
+
+    func removePlayerInfoObserver(_ observer: NSObjectProtocol) {
+        DistributedNotificationCenter.default().removeObserver(observer)
+    }
+
     func sendCommand(_ command: MusicCommand) {
         let scriptSource = """
         tell application \"Music\"
@@ -36,6 +80,58 @@ final class MusicController {
 
         var errorInfo: NSDictionary?
         script.executeAndReturnError(&errorInfo)
+    }
+
+    func pauseIfPlaying() -> Bool {
+        let scriptSource = """
+        tell application \"Music\"
+            if it is running then
+                set stateText to (player state as text)
+                if stateText is \"playing\" then
+                    pause
+                    return \"paused\"
+                end if
+            end if
+        end tell
+        return \"\"
+        """
+
+        return executeString(scriptSource) == "paused"
+    }
+
+    func resumeIfPaused() -> Bool {
+        let scriptSource = """
+        tell application \"Music\"
+            if it is running then
+                set stateText to (player state as text)
+                if stateText is \"paused\" then
+                    play
+                    return \"playing\"
+                end if
+            end if
+        end tell
+        return \"\"
+        """
+
+        return executeString(scriptSource) == "playing"
+    }
+
+    func playerPosition() -> Double? {
+        let scriptSource = """
+        tell application \"Music\"
+            if it is running then
+                try
+                    return (player position as text)
+                end try
+            end if
+        end tell
+        return \"\"
+        """
+
+        guard let value = executeString(scriptSource), !value.isEmpty else {
+            return nil
+        }
+        return numeric(value)
     }
 
     func currentTrackArtwork() -> Data? {
@@ -141,6 +237,19 @@ final class MusicController {
     private func nonEmpty(_ value: String) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func executeString(_ source: String) -> String? {
+        guard let script = NSAppleScript(source: source) else {
+            return nil
+        }
+
+        var errorInfo: NSDictionary?
+        let output = script.executeAndReturnError(&errorInfo)
+        guard errorInfo == nil else {
+            return nil
+        }
+        return output.stringValue
     }
 
     private func numeric(_ value: String) -> Double? {

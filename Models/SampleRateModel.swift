@@ -45,13 +45,29 @@ final class SampleRateModel: ObservableObject {
     private var stableLogSampleRateAt: Date?
     private var logRateWindow: [(rate: Double, date: Date, weight: Int)] = []
     private var lastTrackTitle: String?
+    private var lastTrackID: String?
+    private var currentAlbumID: String?
+    private var notificationTrackName: String?
+    private var hasLookaheadActivity = false
+    private var detectedPreBufferRate: Double?
+    private var albumRateCache: [String: Double] = [:]
+    private var albumRateCacheOrder: [String] = []
     private var lastAppliedSampleRate: Double?
     private var lastAppliedAt: Date?
     private var lastArtworkData: Data?
     private var artworkTrackTitle: String?
     private var isAdjustingVolume = false
+    private var isSwitchingRate = false
+    private var isPreemptivelyPaused = false
+    private var preemptivePauseWork: DispatchWorkItem?
+    private var playerInfoObserver: NSObjectProtocol?
+
+    private let albumRateCacheKey = "albumRateCache"
+    private let albumRateCacheOrderKey = "albumRateCacheOrder"
+    private let maxAlbumRateCacheEntries = 128
 
     init() {
+        loadAlbumRateCache()
         MediaAuthorizationController.requestIfNeeded { granted in
             DispatchQueue.main.async {
                 if !granted {
@@ -60,7 +76,17 @@ final class SampleRateModel: ObservableObject {
             }
         }
         startLogParser()
+        startPlayerInfoObserver()
         startPolling()
+    }
+
+    deinit {
+        if let playerInfoObserver {
+            musicController.removePlayerInfoObserver(playerInfoObserver)
+        }
+        preemptivePauseWork?.cancel()
+        timer?.invalidate()
+        logController.stop()
     }
 
     var menuBarTitle: String {
@@ -157,6 +183,36 @@ final class SampleRateModel: ObservableObject {
         }
     }
 
+    private func startPlayerInfoObserver() {
+        playerInfoObserver = musicController.observePlayerInfo { [weak self] info in
+            self?.handlePlayerInfo(info)
+        }
+    }
+
+    private func handlePlayerInfo(_ info: MusicPlayerInfo) {
+        guard info.hasTrackMetadata, let title = info.title else {
+            if info.state == "Stopped" || info.state == "Unknown" {
+                notificationTrackName = nil
+            }
+            return
+        }
+
+        notificationTrackName = title
+        currentTrackTitle = title
+        artistName = info.artist ?? ""
+        albumName = info.album ?? ""
+        isPlaying = info.isPlaying
+
+        let position = musicController.playerPosition()
+        updateTrackIdentity(title: title,
+                            artist: info.artist,
+                            album: info.album,
+                            albumArtist: info.albumArtist,
+                            isPlaying: info.isPlaying,
+                            position: position)
+        scheduleQuickRefresh()
+    }
+
     private func updateState() {
         let outputDevice = audioController.defaultOutputDeviceInfo()
         let fallbackTrack = musicController.currentTrackInfo()
@@ -222,13 +278,20 @@ final class SampleRateModel: ObservableObject {
             return
         }
 
-        updateTrackTitle(resolvedTitle)
+        let resolvedArtist = info?.artist ?? fallbackTrack?.artist
+        let resolvedAlbum = info?.album ?? fallbackTrack?.album
         currentTrackTitle = resolvedTitle
-        artistName = info?.artist ?? fallbackTrack?.artist ?? ""
-        albumName = info?.album ?? fallbackTrack?.album ?? ""
+        artistName = resolvedArtist ?? ""
+        albumName = resolvedAlbum ?? ""
         isPlaying = info?.isPlaying ?? fallbackTrack?.isPlaying ?? false
         durationSeconds = info?.duration ?? fallbackTrack?.duration
         updateElapsed(info: info, fallback: fallbackTrack)
+        updateTrackIdentity(title: resolvedTitle,
+                            artist: resolvedArtist,
+                            album: resolvedAlbum,
+                            albumArtist: resolvedArtist,
+                            isPlaying: isPlaying,
+                            position: elapsedSeconds)
         updateArtwork(info?.artworkData)
 
         updateCurrentSampleRateDisplay()
@@ -248,17 +311,9 @@ final class SampleRateModel: ObservableObject {
             return
         }
 
-        if let currentOutputRate = outputDevice.sampleRate,
-           abs(currentOutputRate - targetSampleRate) < 1.0 {
-            statusMessage = "Output already at \(formatSampleRate(targetSampleRate))"
-            return
-        }
-
-        if audioController.setDefaultOutputSampleRate(targetSampleRate) {
-            statusMessage = "Switched output to \(formatSampleRate(targetSampleRate))"
-        } else {
-            statusMessage = "Failed to switch output sample rate"
-        }
+        switchToRateIfSafe(targetSampleRate,
+                           reason: "Now playing update",
+                           position: elapsedSeconds)
     }
 
     private func updateElapsed(info: NowPlayingInfo?, fallback: TrackInfo?) {
@@ -313,6 +368,12 @@ final class SampleRateModel: ObservableObject {
             }
         }
 
+        logController.onTrackName = { [weak self] trackName in
+            DispatchQueue.main.async {
+                self?.handleLogTrackName(trackName)
+            }
+        }
+
         logController.onStatus = { [weak self] status in
             DispatchQueue.main.async {
                 self?.logStatusMessage = status
@@ -338,14 +399,20 @@ final class SampleRateModel: ObservableObject {
             return
         }
 
-        if audioController.setDefaultOutputSampleRate(sampleRate) {
-            lastAppliedSampleRate = sampleRate
-            lastAppliedAt = Date()
-            outputSampleRateDisplay = formatSampleRate(sampleRate)
-            statusMessage = "Switched output to \(formatSampleRate(sampleRate))"
-        } else {
-            statusMessage = "Failed to switch output sample rate"
+        switchToRateIfSafe(sampleRate,
+                           reason: "Log locked",
+                           position: elapsedSeconds ?? musicController.playerPosition())
+    }
+
+    private func handleLogTrackName(_ trackName: String) {
+        guard !trackName.isEmpty,
+              let notificationTrackName,
+              normalizedIdentityComponent(trackName) == normalizedIdentityComponent(notificationTrackName),
+              !hasLookaheadActivity else {
+            return
         }
+        hasLookaheadActivity = true
+        logStatusMessage = "Lookahead detected: \(trackName)"
     }
 
     private func handleLogSampleRate(_ rate: Double, message: String?) {
@@ -355,6 +422,14 @@ final class SampleRateModel: ObservableObject {
         }
 
         latestLogCandidateRate = candidateRate
+
+        if hasLookaheadActivity,
+           let stableLogSampleRate,
+           abs(stableLogSampleRate - candidateRate) >= 1.0 {
+            detectedPreBufferRate = candidateRate
+            logStatusMessage = "Pre-buffer detected: \(formatSampleRate(candidateRate))"
+            return
+        }
 
         let weight = (message?.contains("Derived from frames/duration") ?? false) ? 3 : 1
         logRateWindow.append((rate: candidateRate, date: now, weight: weight))
@@ -385,17 +460,9 @@ final class SampleRateModel: ObservableObject {
             }
         }
 
-        if let message, stableLogSampleRate == nil {
+        if message != nil, stableLogSampleRate == nil {
             logStatusMessage = "Log estimating \(formatSampleRate(dominantRate)) (\(dominantWeight)/\(totalWeight))"
         }
-    }
-
-    private func updateTrackTitle(_ title: String) {
-        guard !title.isEmpty else { return }
-        if let lastTrackTitle, lastTrackTitle != title {
-            resetLogLock(reason: "Track changed")
-        }
-        lastTrackTitle = title
     }
 
     private func resetLogLock(reason: String) {
@@ -403,6 +470,7 @@ final class SampleRateModel: ObservableObject {
         stableLogSampleRateAt = nil
         logRateWindow.removeAll()
         latestLogCandidateRate = nil
+        hasLookaheadActivity = false
         trackSampleRateDisplay = "Unknown"
         sampleRateSourceDisplay = "Unknown"
         logStatusMessage = reason
@@ -427,11 +495,14 @@ final class SampleRateModel: ObservableObject {
         trackSampleRateDisplay = formatSampleRate(rate)
         sampleRateSourceDisplay = "Log (locked)"
         logStatusMessage = "\(reason) at \(formatSampleRate(rate))"
+        if let currentAlbumID {
+            rememberAlbumRate(rate, albumID: currentAlbumID)
+        }
         applyLogAutoSwitch(sampleRate: rate)
     }
 
     private func quantizeLogRate(_ rate: Double) -> Double? {
-        let candidates: [Double] = [44100, 48000, 88200, 96000, 176400, 192000]
+        let candidates: [Double] = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000]
         let nearest = candidates.min(by: { abs($0 - rate) < abs($1 - rate) })
         guard let nearest else { return nil }
 
@@ -441,5 +512,188 @@ final class SampleRateModel: ObservableObject {
         }
 
         return nil
+    }
+
+    private func updateTrackIdentity(title: String,
+                                     artist: String?,
+                                     album: String?,
+                                     albumArtist: String?,
+                                     isPlaying: Bool,
+                                     position: Double?) {
+        guard !title.isEmpty else { return }
+
+        notificationTrackName = title
+        let trackID = identityKey([title, artist, album])
+        let albumID = identityKey([albumArtist ?? artist, album])
+        guard !trackID.isEmpty else { return }
+
+        let previousTrackID = lastTrackID
+        let previousAlbumID = currentAlbumID
+        lastTrackTitle = title
+        currentAlbumID = albumID.isEmpty ? nil : albumID
+
+        guard previousTrackID != nil, previousTrackID != trackID else {
+            lastTrackID = trackID
+            return
+        }
+
+        lastTrackID = trackID
+        let sameAlbum = !albumID.isEmpty && albumID == previousAlbumID
+        handleTrackBoundary(albumID: albumID.isEmpty ? nil : albumID,
+                            sameAlbum: sameAlbum,
+                            isPlaying: isPlaying,
+                            position: position)
+    }
+
+    private func handleTrackBoundary(albumID: String?,
+                                     sameAlbum: Bool,
+                                     isPlaying: Bool,
+                                     position: Double?) {
+        resetLogLock(reason: "Track changed")
+
+        if let detectedPreBufferRate {
+            self.detectedPreBufferRate = nil
+            stableLogSampleRate = detectedPreBufferRate
+            trackSampleRateDisplay = formatSampleRate(detectedPreBufferRate)
+            sampleRateSourceDisplay = "Log (pre-buffer)"
+            if let albumID {
+                rememberAlbumRate(detectedPreBufferRate, albumID: albumID)
+            }
+            switchToRateIfSafe(detectedPreBufferRate,
+                               reason: "Pre-buffer",
+                               position: position)
+            return
+        }
+
+        if let albumID, let cachedRate = albumRateCache[albumID] {
+            stableLogSampleRate = cachedRate
+            trackSampleRateDisplay = formatSampleRate(cachedRate)
+            sampleRateSourceDisplay = "Album cache"
+
+            if sameAlbum {
+                statusMessage = "Same album cached at \(formatSampleRate(cachedRate)); not switching mid-album"
+            } else {
+                switchToRateIfSafe(cachedRate,
+                                   reason: "Album cache",
+                                   position: position)
+            }
+            return
+        }
+
+        guard isPlaying, autoSwitchEnabled, isSafeTrackBoundary(position) else {
+            return
+        }
+
+        beginPreemptivePause()
+    }
+
+    private func beginPreemptivePause() {
+        guard !isPreemptivelyPaused,
+              stableLogSampleRate == nil,
+              musicController.pauseIfPlaying() else {
+            return
+        }
+
+        isPreemptivelyPaused = true
+        statusMessage = "Preemptive pause — waiting for sample rate"
+
+        preemptivePauseWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isPreemptivelyPaused else { return }
+            self.isPreemptivelyPaused = false
+            _ = self.musicController.resumeIfPaused()
+            self.statusMessage = "Preemptive pause timeout — continuing playback"
+        }
+        preemptivePauseWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+    }
+
+    private func finishPreemptivePauseIfNeeded() {
+        preemptivePauseWork?.cancel()
+        preemptivePauseWork = nil
+        guard isPreemptivelyPaused else { return }
+        isPreemptivelyPaused = false
+        _ = musicController.resumeIfPaused()
+    }
+
+    private func switchToRateIfSafe(_ rate: Double, reason: String, position: Double?) {
+        guard autoSwitchEnabled, !isSwitchingRate else { return }
+        guard isSafeTrackBoundary(position) || isPreemptivelyPaused else {
+            statusMessage = "Skipping rate matching — track already in progress"
+            return
+        }
+
+        let outputDevice = audioController.defaultOutputDeviceInfo()
+        if let currentOutputRate = outputDevice.sampleRate,
+           abs(currentOutputRate - rate) < 1.0 {
+            statusMessage = "Output already at \(formatSampleRate(rate))"
+            finishPreemptivePauseIfNeeded()
+            return
+        }
+
+        let pausedForSwitch = isPreemptivelyPaused || musicController.pauseIfPlaying()
+        isSwitchingRate = true
+        let switched = audioController.setDefaultOutputSampleRate(rate)
+        isSwitchingRate = false
+
+        if switched {
+            lastAppliedSampleRate = rate
+            lastAppliedAt = Date()
+            outputSampleRate = rate
+            outputSampleRateDisplay = formatSampleRate(rate)
+            statusMessage = "\(reason): switched output to \(formatSampleRate(rate))"
+        } else {
+            statusMessage = "Failed to switch output sample rate"
+        }
+
+        if isPreemptivelyPaused {
+            finishPreemptivePauseIfNeeded()
+        } else if pausedForSwitch {
+            _ = musicController.resumeIfPaused()
+        }
+    }
+
+    private func isSafeTrackBoundary(_ position: Double?) -> Bool {
+        guard let position else { return true }
+        return position <= 0.3
+    }
+
+    private func rememberAlbumRate(_ rate: Double, albumID: String) {
+        guard !albumID.isEmpty else { return }
+        albumRateCache[albumID] = rate
+        albumRateCacheOrder.removeAll { $0 == albumID }
+        albumRateCacheOrder.append(albumID)
+
+        while albumRateCacheOrder.count > maxAlbumRateCacheEntries {
+            let removed = albumRateCacheOrder.removeFirst()
+            albumRateCache.removeValue(forKey: removed)
+        }
+        saveAlbumRateCache()
+    }
+
+    private func loadAlbumRateCache() {
+        let defaults = UserDefaults.standard
+        albumRateCache = defaults.dictionary(forKey: albumRateCacheKey) as? [String: Double] ?? [:]
+        albumRateCacheOrder = defaults.stringArray(forKey: albumRateCacheOrderKey) ?? Array(albumRateCache.keys)
+    }
+
+    private func saveAlbumRateCache() {
+        let defaults = UserDefaults.standard
+        defaults.set(albumRateCache, forKey: albumRateCacheKey)
+        defaults.set(albumRateCacheOrder, forKey: albumRateCacheOrderKey)
+    }
+
+    private func identityKey(_ components: [String?]) -> String {
+        components
+            .compactMap { normalizedIdentityComponent($0 ?? "") }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\u{1f}")
+    }
+
+    private func normalizedIdentityComponent(_ value: String) -> String {
+        value
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
     }
 }
