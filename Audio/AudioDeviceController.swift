@@ -280,7 +280,7 @@ final class AudioDeviceController {
         }
 
         var rate = targetRate
-        var size = UInt32(MemoryLayout<Double>.size)
+        let size = UInt32(MemoryLayout<Double>.size)
         let setStatus = AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &rate)
         return setStatus == noErr
     }
